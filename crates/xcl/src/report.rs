@@ -49,6 +49,8 @@ pub struct Report {
     /// AMD cache-line zero instructions emulated on a host without CLZERO.
     #[serde(default)]
     pub emulated_clzero: u64,
+    #[serde(default)]
+    pub emulated_mwaitx: u64,
     /// what the PC has of what a run needs (DXC, GPU features), checked by `xcl run` first
     #[serde(default)]
     pub environment: Vec<crate::preflight::Check>,
@@ -129,6 +131,7 @@ pub fn build() -> Report {
         crash: CRASH.lock().ok().and_then(|g| g.clone()),
         exit_code: None,
         emulated_clzero: crate::cpu_compat::emulated_clzero(),
+        emulated_mwaitx: crate::cpu_compat::emulated_mwaitx(),
         environment: Vec::new(),
         imports_by_source: by_source,
         stubbed_imports: stubbed,

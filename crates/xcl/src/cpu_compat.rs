@@ -1,6 +1,5 @@
 //! Guest CPU instructions unavailable on some x64 hosts.
 
-use std::arch::x86_64::__cpuid;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,29 +13,32 @@ use windows_sys::Win32::System::Memory::{
     PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READWRITE, PAGE_WRITECOPY,
 };
 use windows_sys::Win32::System::SystemServices::EXCEPTION_NONCONTINUABLE;
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, SwitchToThread};
 
-// AMD64 Architecture Programmer's Manual, volume 3, CLZERO.
+// AMD64 Architecture Programmer's Manual, volume 3.
+const MONITORX: [u8; 3] = [0x0f, 0x01, 0xfa];
+const MWAITX: [u8; 3] = [0x0f, 0x01, 0xfb];
 const CLZERO: [u8; 3] = [0x0f, 0x01, 0xfc];
 const CACHE_LINE_BYTES: usize = 64;
 static EMULATED_CLZERO: AtomicU64 = AtomicU64::new(0);
+static EMULATED_MWAITX: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn emulated_clzero() -> u64 {
     EMULATED_CLZERO.load(Ordering::Relaxed)
 }
 
+pub(crate) fn emulated_mwaitx() -> u64 {
+    EMULATED_MWAITX.load(Ordering::Relaxed)
+}
+
 pub(crate) fn install() {
-    const EXTENDED_FEATURES: u32 = 0x8000_0008;
     unsafe {
-        if __cpuid(0x8000_0000).eax >= EXTENDED_FEATURES
-            && __cpuid(EXTENDED_FEATURES).ebx & 1 != 0
-        {
-            return;
-        }
+        // MONITORX can fault in user mode even when advertised by the host CPU.
+        // Instructions that execute successfully on the host never enter the handler.
         if AddVectoredExceptionHandler(0, Some(handle_illegal_instruction)).is_null() {
-            crate::xlog_warn!("could not install the guest CLZERO fallback");
+            crate::xlog_warn!("could not install the guest CPU instruction fallbacks");
         } else {
-            crate::xlog_info!("guest CLZERO fallback enabled");
+            crate::xlog_info!("guest CPU instruction fallbacks enabled");
         }
     }
 }
@@ -53,30 +55,59 @@ unsafe extern "system" fn handle_illegal_instruction(exception: *mut EXCEPTION_P
         return 0;
     }
     let last_error = GetLastError();
-    let handled = emulate_clzero(context);
+    let handled = emulate_guest_instruction(context);
     SetLastError(last_error);
     if handled {
-        EMULATED_CLZERO.fetch_add(1, Ordering::Relaxed);
         -1 // EXCEPTION_CONTINUE_EXECUTION
     } else {
         0
     }
 }
 
-unsafe fn emulate_clzero(context: &mut CONTEXT) -> bool {
+unsafe fn emulate_guest_instruction(context: &mut CONTEXT) -> bool {
     let process = GetCurrentProcess();
     let mut opcode = [0; CLZERO.len()];
     let mut transferred = 0;
     if ReadProcessMemory(process, context.Rip as *const c_void, opcode.as_mut_ptr().cast(),
                          opcode.len(), &mut transferred) == 0
-        || transferred != opcode.len() || opcode != CLZERO
+        || transferred != opcode.len()
     {
         return false;
     }
 
+    match opcode {
+        CLZERO => {
+            if !zero_cache_line(process, context.Rax) {
+                return false;
+            }
+            EMULATED_CLZERO.fetch_add(1, Ordering::Relaxed);
+        }
+        MONITORX if context.Rcx as u32 == 0 && context.Rdx as u32 == 0 => {
+            // Check the address. The paired MWAITX yields and returns early, so
+            // the title rechecks the condition without a hardware monitor.
+            let mut byte = 0u8;
+            if ReadProcessMemory(process, context.Rax as *const c_void, (&mut byte as *mut u8).cast(),
+                                 1, &mut transferred) == 0 || transferred != 1
+            {
+                return false;
+            }
+        }
+        MWAITX if context.Rax as u32 == 0 && context.Rcx as u32 & !3 == 0 => {
+            // Hardware waits may return without a write. Yield once, then let
+            // the guest's wait loop recheck its condition and timeout.
+            SwitchToThread();
+            EMULATED_MWAITX.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => return false,
+    }
+    context.Rip += opcode.len() as u64;
+    true
+}
+
+unsafe fn zero_cache_line(process: windows_sys::Win32::Foundation::HANDLE, rax: u64) -> bool {
     // Zen 2 ignores the low six address bits. Use ordinary stores via the checked
     // Windows API and leave RIP unchanged if the destination cannot be written.
-    let line = ((context.Rax as usize) & !(CACHE_LINE_BYTES - 1)) as *mut c_void;
+    let line = ((rax as usize) & !(CACHE_LINE_BYTES - 1)) as *mut c_void;
     let mut page = MEMORY_BASIC_INFORMATION::default();
     const WRITABLE: u32 = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
     if VirtualQuery(line, &mut page, size_of::<MEMORY_BASIC_INFORMATION>()) == 0 || page.State != MEM_COMMIT
@@ -85,13 +116,9 @@ unsafe fn emulate_clzero(context: &mut CONTEXT) -> bool {
         return false;
     }
     let zeros = [0u8; CACHE_LINE_BYTES];
-    if WriteProcessMemory(process, line, zeros.as_ptr().cast(), zeros.len(), &mut transferred) == 0
-        || transferred != zeros.len()
-    {
-        return false;
-    }
-    context.Rip += CLZERO.len() as u64;
-    true
+    let mut transferred = 0;
+    WriteProcessMemory(process, line, zeros.as_ptr().cast(), zeros.len(), &mut transferred) != 0
+        && transferred == zeros.len()
 }
 
 #[cfg(test)]
@@ -112,7 +139,7 @@ mod tests {
             ..Default::default()
         };
         let original_rax = context.Rax;
-        assert!(unsafe { emulate_clzero(&mut context) });
+        assert!(unsafe { emulate_guest_instruction(&mut context) });
         assert_eq!(context.Rip, opcode.as_ptr() as u64 + 3);
         assert_eq!(context.Rax, original_rax);
         assert_eq!(context.EFlags, 0x202);
@@ -122,11 +149,31 @@ mod tests {
 
         let other = [0x0f, 0x0b, 0x90];
         context.Rip = other.as_ptr() as u64;
-        assert!(!unsafe { emulate_clzero(&mut context) });
+        assert!(!unsafe { emulate_guest_instruction(&mut context) });
         assert_eq!(context.Rip, other.as_ptr() as u64);
         context.Rip = opcode.as_ptr() as u64;
         context.Rax = 0;
-        assert!(!unsafe { emulate_clzero(&mut context) });
+        assert!(!unsafe { emulate_guest_instruction(&mut context) });
         assert_eq!(context.Rip, opcode.as_ptr() as u64);
+    }
+
+    #[test]
+    fn monitor_wait_fallback_preserves_flags_and_registers() {
+        let opcode = [MONITORX, MWAITX].concat();
+        let address = [0x42u8];
+        let mut context = CONTEXT {
+            Rip: opcode.as_ptr() as u64,
+            Rax: address.as_ptr() as u64,
+            Rbx: 1000,
+            EFlags: 0x202,
+            ..Default::default()
+        };
+        assert!(unsafe { emulate_guest_instruction(&mut context) });
+        assert_eq!(context.Rax, address.as_ptr() as u64);
+        context.Rax = 0;
+        context.Rcx = 2;
+        assert!(unsafe { emulate_guest_instruction(&mut context) });
+        assert_eq!(context.Rip, opcode.as_ptr() as u64 + 6);
+        assert_eq!((context.Rax, context.Rbx, context.Rcx, context.EFlags), (0, 1000, 2, 0x202));
     }
 }

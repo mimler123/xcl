@@ -241,7 +241,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
-        list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+        super::present::with_display_render_target(this, super::present::rt0_resource(this as usize), || {
+            list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+        });
     }
 }
 
@@ -278,7 +280,10 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     base_vertex: i32,
     first_instance: u32,
 ) {
-    list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+    let this = list.as_raw();
+    super::present::with_display_render_target(this, super::present::rt0_resource(this as usize), || {
+        list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+    });
 }
 
 /// Before a draw: with a translated pipeline its ABI root signature and the kept graphics

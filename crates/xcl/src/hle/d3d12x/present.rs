@@ -11,8 +11,8 @@
 //! and after ExecuteCommandLists presents the latest back-buffer-like render target – on a
 //! call of another console-only queue method, or rate-limited after submissions.
 //!
-//! The back buffer is copied on the title's own queue (implicit promotion from
-//! COMMON/PRESENT state, which consoles require before PresentX).
+//! The back buffer is copied on the title's own queue. For console display targets with a
+//! known state we transition to COPY_SOURCE and restore the title's state after the copy.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -43,6 +43,126 @@ static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
 /// the title called PresentX: the fallback guessing is off
 static PRESENTX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static PRESENTX_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Default)]
+struct DisplayStates {
+    submitted: HashMap<usize, (Option<D3D12_RESOURCE_STATES>, usize)>,
+    recorded: HashMap<usize, HashMap<usize, Option<D3D12_RESOURCE_STATES>>>,
+}
+
+impl DisplayStates {
+    fn record(&mut self, list: usize, resource: usize, state: Option<D3D12_RESOURCE_STATES>) {
+        if self.submitted.contains_key(&resource) {
+            self.recorded.entry(list).or_default().insert(resource, state);
+        }
+    }
+
+    fn state_for_recording(&self, list: usize, resource: usize) -> Option<D3D12_RESOURCE_STATES> {
+        if let Some(state) = self.recorded.get(&list).and_then(|states| states.get(&resource)) {
+            *state
+        } else {
+            self.submitted.get(&resource)?.0
+        }
+    }
+
+    fn submit(&mut self, queue: usize, list: usize) {
+        if let Some(states) = self.recorded.get(&list) {
+            for (&resource, &state) in states {
+                if let Some(current) = self.submitted.get_mut(&resource) {
+                    *current = (state, queue);
+                }
+            }
+        }
+    }
+
+    fn state_for_copy(&self, queue: usize, resource: usize) -> Option<D3D12_RESOURCE_STATES> {
+        let &(state, last_queue) = self.submitted.get(&resource)?;
+        if last_queue == 0 || last_queue == queue { state } else { None }
+    }
+}
+
+static DISPLAY_STATES: Mutex<Option<DisplayStates>> = Mutex::new(None);
+
+pub(super) unsafe fn register_display(resource: usize, state: u32) {
+    let Some(desc) = backbuffer_like(resource) else { return };
+    // These display formats have one plane. Only track targets with exactly one subresource.
+    if desc.MipLevels == 1 && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS).0 == 0 {
+        DISPLAY_STATES.lock().unwrap().get_or_insert_with(DisplayStates::default)
+            .submitted.insert(resource, (Some(D3D12_RESOURCE_STATES(state as i32)), 0));
+    }
+}
+
+pub(super) fn forget_display(resource: usize) {
+    if let Some(states) = DISPLAY_STATES.lock().unwrap().as_mut() {
+        if states.submitted.remove(&resource).is_some() {
+            for recording in states.recorded.values_mut() {
+                recording.remove(&resource);
+            }
+        }
+    }
+}
+
+pub(super) fn reset_display_recording(list: usize) {
+    if let Some(bindings) = LISTS.lock().unwrap().as_mut() {
+        bindings.remove(&list);
+    }
+    if let Some(states) = DISPLAY_STATES.lock().unwrap().as_mut() {
+        states.recorded.remove(&list);
+    }
+}
+
+pub(super) fn record_display_barriers(list: usize, barriers: &[[u32; 8]]) {
+    if let Some(states) = DISPLAY_STATES.lock().unwrap().as_mut() {
+        for b in barriers.iter().filter(|b| b[0] == 0 && (b[4] == 0 || b[4] == u32::MAX)) {
+            let resource = (b[2] as usize) | ((b[3] as usize) << 32);
+            let state = (b[1] != D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY.0 as u32)
+                .then_some(D3D12_RESOURCE_STATES(b[6] as i32));
+            states.record(list, resource, state);
+        }
+    }
+}
+
+pub(super) fn submit_display_recordings(queue: usize, lists: &[*mut c_void]) {
+    if let Some(states) = DISPLAY_STATES.lock().unwrap().as_mut() {
+        for list in lists {
+            states.submit(queue, *list as usize);
+        }
+    }
+}
+
+pub(super) unsafe fn with_display_render_target(list: *mut c_void, resource: Option<usize>, op: impl FnOnce()) {
+    let state = resource.and_then(|res| {
+        DISPLAY_STATES.lock().unwrap().as_ref()?.state_for_recording(list as usize, res)
+            .filter(|state| *state != D3D12_RESOURCE_STATE_RENDER_TARGET)
+            .map(|state| (res, state))
+    });
+    if let Some((res, previous)) = state {
+        super::list_x::transition(list, res, previous, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        op();
+        super::list_x::transition(list, res, D3D12_RESOURCE_STATE_RENDER_TARGET, previous);
+    } else {
+        op();
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn display_state_follows_submission_order_and_split_completion() {
+    let mut states = DisplayStates::default();
+    states.submitted.insert(1, (Some(D3D12_RESOURCE_STATE_UNORDERED_ACCESS), 0));
+    states.record(10, 1, None);
+    states.record(11, 1, Some(D3D12_RESOURCE_STATE_RENDER_TARGET));
+    states.record(11, 2, Some(D3D12_RESOURCE_STATE_RENDER_TARGET));
+
+    assert_eq!(states.state_for_recording(10, 1), None);
+    assert_eq!(states.state_for_copy(5, 1), Some(D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+    states.submit(5, 10);
+    assert_eq!(states.state_for_copy(5, 1), None);
+    states.submit(5, 11);
+    assert_eq!(states.state_for_copy(5, 1), Some(D3D12_RESOURCE_STATE_RENDER_TARGET));
+    assert_eq!(states.state_for_copy(6, 1), None);
+    assert_eq!(states.state_for_copy(5, 2), None);
+}
 
 /// command queue #30 PresentX(planeCount, planes, parameters): plane 0's first resource is
 /// the frame; S_OK always (a console present does not fail for the title).
@@ -210,7 +330,14 @@ pub fn note_rt0(list: usize, handle: usize) {
     if !enabled() {
         return;
     }
-    LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(list, handle);
+    let mut lists = LISTS.lock().unwrap();
+    if handle == 0 {
+        if let Some(lists) = lists.as_mut() {
+            lists.remove(&list);
+        }
+    } else {
+        lists.get_or_insert_with(HashMap::new).insert(list, handle);
+    }
 }
 
 /// Format the swap chain uses for a back buffer of `f` (None = not presentable).
@@ -616,6 +743,12 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     }
     let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
     p.list.ResourceBarrier(&b1);
+    let source_state = DISPLAY_STATES.lock().unwrap().as_ref()
+        .and_then(|states| states.state_for_copy(queue, src.as_raw() as usize))
+        .filter(|state| *state != D3D12_RESOURCE_STATE_COMMON && (*state & D3D12_RESOURCE_STATE_COPY_SOURCE).0 == 0);
+    if let Some(state) = source_state {
+        p.list.ResourceBarrier(&[transition(&src, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+    }
     p.list.CopyResource(&bb, &src);
     let due = frame_dump_due();
     let mut dumps = Vec::new();
@@ -646,6 +779,9 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             let tag = if k == 0 { "rt".into() } else { format!("rt{k}") };
             dumps.push(FrameDump { _source: res, buffer, footprint, format, tag });
         }
+    }
+    if let Some(state) = source_state {
+        p.list.ResourceBarrier(&[transition(&src, D3D12_RESOURCE_STATE_COPY_SOURCE, state)]);
     }
     let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
     p.list.ResourceBarrier(&b2);

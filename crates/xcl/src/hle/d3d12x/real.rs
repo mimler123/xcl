@@ -1398,6 +1398,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::sparse::forget_buffer(this as usize);
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
+        super::present::forget_display(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
@@ -1870,6 +1871,7 @@ unsafe fn create_display_target(this: *mut c_void, props: usize, desc: usize, st
         crate::xlog_warn!("D3D12.X: display target: {hr:#x}; desc {x:02x?}");
         return hr;
     }
+    super::present::register_display(*ppv as usize, state as u32);
     let size = crate::hle::xg::Texture::new(&x).map_or(0, |t| t.size()) as usize;
     let at = if size > 0 { crate::hle::kernelx::runtime_alloc(size, crate::hle::kernelx::D3D_DISPLAY_TARGET) } else { None };
     if let Some(p) = at {
@@ -2093,6 +2095,9 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     let resolved = super::pso_async::resolve_for_bind(initial_state as usize) as *mut c_void;
     let hr = f(this, allocator, resolved);
     preserve_vtable(this, ext);
+    if hr >= 0 {
+        super::present::reset_display_recording(this as usize);
+    }
     hr
 }
 
@@ -3941,16 +3946,17 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
 unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *const [f32; 4], n: u32, rects: *const c_void) {
     type F = unsafe extern "system" fn(*mut c_void, usize, *const [f32; 4], u32, *const c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearRenderTargetView")));
+    let resource = super::present::rtv_resource(rtv);
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 16 {
             crate::xlog_info!("frame trace: ClearRenderTargetView {rtv:#x} → {:?} colour {:?}, {n} rects", super::present::rtv_resource(rtv), color.as_ref());
         }
-        if let Some(r) = super::present::rtv_resource(rtv) {
+        if let Some(r) = resource {
             super::present::note_use(r, super::present::USE_CLEAR);
         }
     }
-    f(this, rtv, color, n, rects)
+    super::present::with_display_render_target(this, resource, || f(this, rtv, color, n, rects));
 }
 
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
@@ -3965,8 +3971,9 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
             crate::xlog_info!("frame trace: OMSetRenderTargets({n}, first {first:#x} → {:?}, single {single}, dsv {:?})", super::present::rtv_resource(first), dsv.as_ref().copied());
         }
     }
-    if n > 0 && !rtvs.is_null() {
-        super::present::note_rt0(this as usize, *rtvs);
+    let has_rtv = n > 0 && !rtvs.is_null();
+    super::present::note_rt0(this as usize, if has_rtv { *rtvs } else { 0 });
+    if has_rtv {
         if super::present::trace_frame() {
             for k in 0..n as usize {
                 let h = if single != 0 { *rtvs + k * 32 } else { *rtvs.add(k) };
@@ -4265,6 +4272,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits(&mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
+        super::present::submit_display_recordings(this as usize, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
     });
