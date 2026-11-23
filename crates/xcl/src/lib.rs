@@ -9,6 +9,7 @@
 pub mod log;
 pub mod manifest;
 pub mod config;
+mod cpu_compat;
 pub mod disasm;
 pub mod eh;
 pub mod gpu;

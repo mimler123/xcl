@@ -256,6 +256,15 @@ impl Vfs {
         let Some(abs) = full(&p) else { return Target::Pass };
         let abs = trim_sep(&strip_verbatim(&norm(&abs)));
         let lc = abs.to_lowercase();
+        // A profile below the package contains XCL's logs, saves and TLS carriers.
+        // Applying copy-on-write there would send the host's writes into its own overlay.
+        let nested_profile = self.data_root_lc.strip_prefix(&self.game_root_lc)
+            .is_some_and(|rest| rest.starts_with('\\'));
+        if nested_profile && lc.strip_prefix(&self.data_root_lc)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('\\'))
+        {
+            return if translated { Target::Translated(abs) } else { Target::Pass };
+        }
         if lc == self.game_root_lc {
             return Target::Game { rel: String::new() };
         }
@@ -720,6 +729,25 @@ mod tests {
         let mangled = format!("{drive}\\cwd\\GAME:\\data\\hello.txt");
         assert_eq!(v.classify(&mangled), Target::Game { rel: "data\\hello.txt".into() });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nested_profile_paths_keep_their_native_destination() {
+        let fixture = Fixture::new("nested_profile");
+        let game = fixture.game();
+        let data = game.join("profile");
+        let temp = data.join("temp");
+        let v = Vfs::new(&game, &data, vec![("T:".into(), temp.to_string_lossy().into_owned())]);
+
+        let log = data.join("logs").join("report.json");
+        assert_eq!(v.open_decision(&log.to_string_lossy(), 0x4000_0000, CREATE_ALWAYS, 0), Decision::Pass);
+        let scratch = temp.join("scratch.bin");
+        assert_eq!(v.classify(r"T:\scratch.bin"), Target::Translated(scratch.to_string_lossy().into_owned()));
+        let sibling = game.join("profile_backup").join("report.json");
+        assert_eq!(v.classify(&sibling.to_string_lossy()), Target::Game { rel: r"profile_backup\report.json".into() });
+        let package = game.join("data").join("hello.txt");
+        assert!(matches!(v.open_decision(&package.to_string_lossy(), 0x4000_0000, OPEN_EXISTING, 0),
+                         Decision::Use(path) if path.starts_with(data.join("overlay").to_str().unwrap())));
     }
 
     #[test]

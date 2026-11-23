@@ -134,6 +134,7 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
 }
 
 pub fn install_crash_handler() {
+    crate::cpu_compat::install();
     unsafe {
         if let Err(e) = hooks::hook("ntdll.dll", "NtTerminateProcess", hk_nt_terminate_process as usize, &ORIG_NT_TERMINATE) {
             crate::xlog_warn!("{e}");

@@ -129,6 +129,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
 
+For repeatable startup and graphics captures, see [Windows boot triage](docs/boot-triage.md).
+
 ## Tests
 
 ```powershell

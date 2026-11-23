@@ -699,12 +699,17 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
 /// n > 1: every n-th; a title loading at a few frames a second shows few)
 /// (`frame_<n>.bmp`, a quarter of each side; `XCL_FRAME_DUMP_FULL=1`: full size) – what the title presented, before the window.
 fn frame_dump_due() -> bool {
-    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let every = *EVERY.get_or_init(|| match std::env::var("XCL_FRAME_DUMP") {
-        Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
-        Err(_) => 0,
+    static DUMP: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    let (first, every) = *DUMP.get_or_init(|| {
+        let first = std::env::var("XCL_FRAME_DUMP_FIRST").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let every = match std::env::var("XCL_FRAME_DUMP") {
+            Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
+            Err(_) => 0,
+        };
+        (first, every)
     });
-    every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
+    let shown = PRESENTS.load(Ordering::Relaxed);
+    shown < first || (every > 0 && shown % every == 20.min(every - 1))
 }
 
 /// Frames shown so far.
