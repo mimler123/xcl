@@ -125,6 +125,8 @@ def triage(args):
         env["XCL_RUN_SECONDS"] = str(args.seconds)
     if args.adapter:
         env["XCL_ADAPTER"] = args.adapter
+    if args.dxc_threads is not None:
+        env["XCL_DXC_THREADS"] = str(args.dxc_threads)
     if args.graphics:
         env.update(XCL_TRACE_FRAME="1", XCL_TRACE_FRAME_EVENTS="1",
                    XCL_FRAME_DUMP_FIRST="2", XCL_FRAME_DUMP="1", XCL_DRED="1")
@@ -168,6 +170,7 @@ def main():
     parser.add_argument("--run", action="store_true", help="Run the title after static inspection")
     parser.add_argument("--seconds", type=int, default=20, help="XCL runtime budget (default 20)")
     parser.add_argument("--adapter", help="XCL adapter index or name")
+    parser.add_argument("--dxc-threads", type=int, help="Number of shader and pipeline workers (1 to 64)")
     parser.add_argument("--graphics", action="store_true", help="Capture frame traces, thumbnails and DRED")
     args = parser.parse_args()
     if os.name != "nt":
@@ -176,6 +179,8 @@ def main():
         parser.error("--seconds must be positive")
     if args.graphics and not args.run:
         parser.error("--graphics requires --run")
+    if args.dxc_threads is not None and not 1 <= args.dxc_threads <= 64:
+        parser.error("--dxc-threads must be between 1 and 64")
     try:
         return triage(args)
     except (OSError, ValueError, KeyError) as error:

@@ -9,7 +9,7 @@ py -3 .\scripts\boot_triage.py D:\Games\Title\game.exe --output D:\Captures\xcl 
 py -3 .\scripts\boot_triage.py D:\Games\Title\game.exe --output D:\Captures\xcl --run --seconds 30 --graphics
 ```
 
-Use `--xcl` to compare builds and `--adapter` to select a GPU. The script records the input and XCL binary hashes. It starts each run with a cold XCL shader cache. The title's own timeout allows report finalization. If startup or shutdown hangs, the script attempts to terminate the XCL process tree at the outer timeout.
+Use `--xcl` to compare builds, `--adapter` to select a GPU, and `--dxc-threads` to try fewer shader and pipeline workers after an allocation failure. The script records the input and XCL binary hashes. It starts each run with a cold XCL shader cache. The title's own timeout allows report finalization. If startup or shutdown hangs, the script attempts to terminate the XCL process tree at the outer timeout.
 
 ## Debugging a run
 
