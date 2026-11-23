@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ METRICS = (
     "presents", "frame_boundaries", "translated_pipelines", "failed_pipelines",
     "fallback_pipelines", "fallback_root_signatures", "background_pipelines",
 )
+VALIDATION = re.compile(r"D3D12 debug layer \((error|warning), id (\d+)\): (.*)")
 
 
 def write_json(path, value):
@@ -104,9 +106,26 @@ def summarize(folder):
             "unknown_iids": d3d.get("unknown_iids", []),
             "frame_dumps": [bmp.relative_to(folder).as_posix()
                             for bmp in sorted(path.parent.glob("frame_*.bmp"))],
+            "d3d12_validation": summarize_validation(path.with_name("xcl.log")),
             "called_stubs": data.get("called_stubs", [])[:30],
         }
     return summary
+
+
+def summarize_validation(log):
+    if not log.is_file():
+        return []
+    messages = {}
+    with log.open(encoding="utf-8", errors="replace") as lines:
+        for line in lines:
+            match = VALIDATION.search(line)
+            if match:
+                level, identifier, example = match.groups()
+                entry = messages.setdefault((level, identifier), {
+                    "level": level, "id": int(identifier), "count": 0, "first": example,
+                })
+                entry["count"] += 1
+    return sorted(messages.values(), key=lambda item: (item["level"], -item["count"], item["id"]))[:12]
 
 
 def triage(args):
@@ -127,6 +146,10 @@ def triage(args):
         env["XCL_ADAPTER"] = args.adapter
     if args.dxc_threads is not None:
         env["XCL_DXC_THREADS"] = str(args.dxc_threads)
+    if args.d3d12_debug:
+        env["XCL_D3D12_DEBUG"] = "1"
+    if args.experimental_mesh_stream:
+        env["XCL_NORMALIZE_MESH_STREAM"] = "1"
     if args.graphics:
         env.update(XCL_TRACE_FRAME="1", XCL_TRACE_FRAME_EVENTS="1",
                    XCL_FRAME_DUMP_FIRST="2", XCL_FRAME_DUMP="1", XCL_DRED="1")
@@ -172,13 +195,16 @@ def main():
     parser.add_argument("--adapter", help="XCL adapter index or name")
     parser.add_argument("--dxc-threads", type=int, help="Number of shader and pipeline workers (1 to 64)")
     parser.add_argument("--graphics", action="store_true", help="Capture frame traces, thumbnails and DRED")
+    parser.add_argument("--d3d12-debug", action="store_true", help="Enable Windows D3D12 validation messages")
+    parser.add_argument("--experimental-mesh-stream", action="store_true",
+                        help="Try the diagnostic console mesh stream retagging path")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("XCL requires Windows")
     if args.seconds <= 0:
         parser.error("--seconds must be positive")
-    if args.graphics and not args.run:
-        parser.error("--graphics requires --run")
+    if (args.graphics or args.d3d12_debug or args.experimental_mesh_stream) and not args.run:
+        parser.error("--graphics, --d3d12-debug and --experimental-mesh-stream require --run")
     if args.dxc_threads is not None and not 1 <= args.dxc_threads <= 64:
         parser.error("--dxc-threads must be between 1 and 64")
     try:

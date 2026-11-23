@@ -3414,6 +3414,73 @@ unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
     shader_bytes(&b)
 }
 
+/// Some console streams use the desktop AS tag for an MS program. Retag only
+/// when the DXIL header identifies the program as MS and no MS tag exists.
+unsafe fn normalize_mesh_stream(desc: *const c_void) -> Option<Vec<u8>> {
+    const AS: u32 = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32;
+    const MS: u32 = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32;
+    if !crate::gpu::shader::readable(desc as usize, 16) {
+        return None;
+    }
+    let (size, base) = (*(desc as *const usize), *((desc as *const usize).add(1)));
+    if !crate::gpu::shader::readable(base, size) {
+        return None;
+    }
+    let buf = std::slice::from_raw_parts(base as *const u8, size);
+    let subs = stream_subobjects(buf)?;
+    if subs.iter().any(|(ty, _)| *ty == MS) {
+        return None;
+    }
+    let (_, payload) = subs.iter().find(|(ty, _)| *ty == AS)?;
+    let shader = payload_shader(payload)?;
+    let dxil = crate::gpu::shader::container_parts(shader)?.into_iter().find(|p| p.fourcc == "DXIL")?;
+    let header = shader.get(dxil.offset..dxil.offset + dxil.size)?;
+    // The upper half of the first DXIL program dword is the shader kind (13 = mesh).
+    if header.get(2..4)? != 13u16.to_le_bytes() || header.get(8..12)? != b"DXIL" {
+        return None;
+    }
+
+    let offset = payload.as_ptr() as usize - base - 8; // the AS/MS payload is 8-byte aligned
+    let mut normalized = buf.to_vec();
+    normalized[offset..offset + 4].copy_from_slice(&MS.to_le_bytes());
+    Some(normalized)
+}
+
+#[cfg(test)]
+#[test]
+fn retags_console_mesh_stream_using_program_header() {
+    let shader = |kind: u16| {
+        let mut blob = [0u8; 68];
+        blob[..4].copy_from_slice(b"DXBC");
+        blob[28..32].copy_from_slice(&1u32.to_le_bytes());
+        blob[32..36].copy_from_slice(&36u32.to_le_bytes());
+        blob[36..40].copy_from_slice(b"DXIL");
+        blob[40..44].copy_from_slice(&24u32.to_le_bytes());
+        blob[46..48].copy_from_slice(&kind.to_le_bytes());
+        blob[52..56].copy_from_slice(b"DXIL");
+        blob
+    };
+    let mesh = shader(13);
+    let amplification = shader(14);
+    let as_tag = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS;
+    let ms_tag = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS;
+    let normalize = |stream: &StreamOut| {
+        let desc = [stream.0.len(), stream.0.as_ptr() as usize];
+        unsafe { normalize_mesh_stream(desc.as_ptr().cast()) }
+    };
+    let mut stream = StreamOut::default();
+    stream.shader(as_tag, &mesh);
+    let normalized = normalize(&stream).unwrap();
+    assert_eq!(stream_subobjects(&normalized).unwrap()[0].0, ms_tag.0 as u32);
+    assert_eq!(stream_subobjects(&stream.0).unwrap()[0].0, as_tag.0 as u32);
+    stream.shader(ms_tag, &mesh);
+    assert!(normalize(&stream).is_none());
+
+    let mut stream = StreamOut::default();
+    stream.shader(as_tag, &amplification);
+    assert!(normalize(&stream).is_none());
+}
+
 /// The console PS of a two-pass pipeline (a PC PS passes as it is).
 /// The PS of a two-pass pipeline (DXIL, static samplers – a PC PS passes as it is).
 fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
@@ -3768,6 +3835,18 @@ unsafe fn put<T>(to: &mut T, from: &[u8]) {
 }
 
 pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    // Retagging is diagnostic while the resulting mesh pipeline is still under test.
+    static RETAG_MESH: OnceLock<bool> = OnceLock::new();
+    let retag = *RETAG_MESH.get_or_init(|| std::env::var("XCL_NORMALIZE_MESH_STREAM").as_deref() == Ok("1"));
+    let normalized = if retag { normalize_mesh_stream(desc) } else { None };
+    let normalized_desc = normalized.as_ref().map(|buf| [buf.len(), buf.as_ptr() as usize]);
+    if normalized_desc.is_some() {
+        static RETAGS: AtomicU64 = AtomicU64::new(0);
+        if RETAGS.fetch_add(1, Ordering::Relaxed) < 5 {
+            crate::xlog_info!("D3D12.X: retagged console mesh bytecode from AS to MS");
+        }
+    }
+    let desc = normalized_desc.as_ref().map_or(desc, |d| d.as_ptr().cast());
     super::null::capture_stream_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_mesh_stream(this, desc, riid, ppv)) } else { (translated_mesh_stream(this, desc, riid, ppv), false) };
